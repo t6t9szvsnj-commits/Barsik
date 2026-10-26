@@ -1,0 +1,135 @@
+name: Приложение Барсик
+
+# Собирает Барсик.app — версию 3, которую запускают двойным кликом, без
+# установки Python и без Терминала. Собрать .app можно только на Маке,
+# поэтому это делает GitHub. С main готовый архив выкладывается в Releases.
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - "versions/**"
+      - "tools/app/**"
+      - ".github/workflows/app.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write     # чтобы выложить архив в Releases
+
+jobs:
+  build-app:
+    name: Собрать Барсик.app
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Python с python.org, а не из setup-python: только он собран сразу под
+      # оба процессора (universal2) вместе с Tk 8.6, а приложение должно
+      # работать и на Маках с M1–M4, и на старых с Intel.
+      - name: Python с python.org (universal2)
+        run: |
+          curl -fsSL -o python.pkg https://www.python.org/ftp/python/3.12.10/python-3.12.10-macos11.pkg
+          sudo installer -pkg python.pkg -target /
+          PY=/Library/Frameworks/Python.framework/Versions/3.12/bin/python3.12
+          "$PY" -c "import sys, tkinter; print(sys.version.split()[0], 'Tk', tkinter.TkVersion)"
+          echo "PY=$PY" >> "$GITHUB_ENV"
+
+      - name: Поставить PyInstaller
+        run: $PY -m pip install --quiet "pyinstaller>=6,<7"
+
+      - name: Собрать
+        run: $PY -m PyInstaller --noconfirm --clean --distpath dist --workpath build tools/app/barsik.spec
+
+      - name: Проверить приложение
+        run: |
+          set -o pipefail     # иначе провал --check потерялся бы за tee
+          BIN="dist/Барсик.app/Contents/MacOS/Barsik"
+          echo "процессоры: $(lipo -archs "$BIN")"
+          lipo -archs "$BIN" | grep -q arm64
+          lipo -archs "$BIN" | grep -q x86_64
+          echo "--- запуск изнутри приложения (M-чип) ---"
+          # Ненастоящий ключ включает проверку связи с ИИ: сервер ответит
+          # «ключ неверный», но важно, что HTTPS-сертификат принят — у
+          # Python с python.org внутри .app своих сертификатов нет.
+          ANTHROPIC_API_KEY=not-a-real-key "$BIN" --check | tee check.txt
+          grep -q "связь с ИИ: *есть" check.txt
+          echo "--- то же через Rosetta, как на Intel ---"
+          if arch -x86_64 /usr/bin/true 2>/dev/null; then
+            arch -x86_64 "$BIN" --check
+          else
+            echo "на этой машине нет Rosetta — Intel-часть собрана, но не запускалась"
+          fi
+          du -sh "dist/Барсик.app"
+
+      - name: Упаковать
+        # ditto, а не zip: сохраняет симлинки и права внутри .app
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent "dist/Барсик.app" Barsik-mac.zip
+          ls -lh Barsik-mac.zip
+
+      - name: Проверить сам архив, как его получит пользователь
+        # Проверяем не собранную папку, а то, что окажется у неё: архив,
+        # распакованный заново. Битая подпись — и Мак на M-чипе напишет, что
+        # приложение «повреждено», вместо обычного «Всё равно открыть».
+        run: |
+          set -o pipefail
+          rm -rf unpacked && mkdir unpacked
+          ditto -x -k Barsik-mac.zip unpacked
+          APP="unpacked/Барсик.app"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          "$APP/Contents/MacOS/Barsik" --check | tee unpacked-check.txt
+          grep -q "кадры Барсика: *на месте" unpacked-check.txt
+          grep -q "гортензия: *на месте" unpacked-check.txt
+          plutil -p "$APP/Contents/Info.plist" | grep -E "CFBundleDisplayName|NSAppleEventsUsageDescription|NSDesktopFolderUsageDescription"
+
+      - name: Ключ из файла настроек и связь с OpenRouter
+        # Так, как будет у пользователя: приложение запущено не из Терминала, ключ
+        # лежит в ~/.desktop_assistant_ai, провайдер — OpenRouter. У него своя
+        # цепочка сертификатов, проверка против Anthropic её не покрывала.
+        run: |
+          set -o pipefail
+          cat > ~/.desktop_assistant_ai <<'EOF'
+          ASSISTANT_PROVIDER=openai
+          OPENAI_API_KEY=sk-or-not-a-real-key
+          ASSISTANT_BASE_URL=https://openrouter.ai/api/v1
+          ASSISTANT_MODEL=anthropic/claude-sonnet-5
+          EOF
+          env -u ANTHROPIC_API_KEY -u OPENAI_API_KEY "unpacked/Барсик.app/Contents/MacOS/Barsik" --check | tee key-check.txt
+          grep -q "ключ ИИ: *задан" key-check.txt
+          grep -q "связь с ИИ: *есть" key-check.txt
+          rm ~/.desktop_assistant_ai
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Barsik-mac
+          path: Barsik-mac.zip
+
+      - name: Выложить в Releases
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # Прошлую сборку не удаляем, а переименовываем в barsik-<коммит>:
+        # если новая версия не понравится, старая лежит в Releases рядом.
+        run: |
+          OLD=$(gh release view barsik-latest --json targetCommitish -q .targetCommitish 2>/dev/null || true)
+          if [ -n "$OLD" ] && [ "$OLD" != "${{ github.sha }}" ]; then
+            OLD_TAG="barsik-${OLD:0:7}"
+            gh api "repos/${{ github.repository }}/git/refs" -f ref="refs/tags/$OLD_TAG" -f sha="$OLD" || true
+            if gh release view "$OLD_TAG" >/dev/null 2>&1; then
+              gh release delete barsik-latest --yes
+            else
+              gh release edit barsik-latest --tag "$OLD_TAG" --title "Барсик для Mac — прошлая версия (${OLD:0:7})" --latest=false
+            fi
+          else
+            gh release delete barsik-latest --yes || true
+          fi
+          gh api -X DELETE "repos/${{ github.repository }}/git/refs/tags/barsik-latest" || true
+          gh release create barsik-latest Barsik-mac.zip \
+            --target "${{ github.sha }}" \
+            --latest \
+            --title "Барсик для Mac" \
+            --notes "Скачай Barsik-mac.zip, открой — появится «Барсик». Перетащи его в «Программы».
+
+          Первый запуск: macOS скажет, что не может проверить разработчика (приложение не подписано платным аккаунтом Apple). Открой Системные настройки → Конфиденциальность и безопасность и нажми «Всё равно открыть». Дальше запускается как обычно.
+
+          Собрано из коммита ${{ github.sha }}."

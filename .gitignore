@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# macOS
+.DS_Store
+._*
+
+# Редакторы
+.vscode/
+.idea/
+*.swp
+
+# Журнал отката — живёт в домашней папке, но на всякий случай
+.desktop_assistant_undo.json
+
+# кадры 3D-рендера — пересобираются tools/3d
+render3d/
+
+# сборка Барсик.app (PyInstaller)
+build/
+dist/

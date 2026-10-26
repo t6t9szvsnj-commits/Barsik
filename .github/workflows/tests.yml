@@ -1,0 +1,251 @@
+name: Тесты
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tests:
+    # Программа для macOS, поэтому и проверяем на macOS: там же, где она
+    # реально запускается, и с тем же Tk.
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Поставить Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Проверить, что tkinter на месте
+        run: python -c "import tkinter; print('Tk', tkinter.TkVersion)"
+
+      - name: Синтаксис
+        run: |
+          python -m py_compile versions/desktop_assistant.py versions/desktop_cat.py versions/desktop_barsik.py
+
+      - name: Линтер
+        run: |
+          python -m pip install --quiet pyflakes
+          python -m pyflakes versions/*.py tests/*.py
+
+      - name: Тесты
+        run: python -m unittest discover -s tests -t . -v
+
+  e2e:
+    name: Барсик целиком на настоящих файлах
+    # Настоящий Барсик (не демо) во временной домашней папке: правила, откат,
+    # план от ИИ через поддельный сервер, опасный шаг, откат. См.
+    # tools/e2e_barsik.py. Нужен экран — на macos-latest он есть.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Сквозная проверка
+        run: python tools/e2e_barsik.py
+
+  # Идентификатор job'а обязан быть латиницей — GitHub не принимает
+  # кириллицу здесь и молча отказывается разбирать весь файл.
+  window-probe:
+    name: Проверка окон на настоящей macOS
+    # Единственное место, где можно спросить настоящую macOS, работают ли
+    # прозрачные окна без рамки — локально и в облаке этого не проверить.
+    # Job информационный: на машине без графической сессии Tk не стартует,
+    # и это не повод валить сборку.
+    runs-on: macos-latest
+    continue-on-error: true
+    env:
+      PYTHONPATH: versions      # все три версии лежат в папке versions/
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Диагностика окружения
+        run: python versions/desktop_cat.py --check
+
+      - name: Диагностика версии 3 (Барсик)
+        run: python versions/desktop_barsik.py --check
+
+      - name: Создать настоящее прозрачное окно без рамки
+        run: |
+          python - <<'PY'
+          import tkinter as tk
+          root = tk.Tk(); root.withdraw()
+          win = tk.Toplevel(root)
+          for name, action in [
+              ("окно без рамки", lambda: root.tk.call(
+                  "::tk::unsupported::MacWindowStyle", "style", str(win),
+                  "plain", "none")),
+              ("прозрачность", lambda: (win.attributes("-transparent", True),
+                                        win.configure(bg="systemTransparent"))),
+              ("поверх всех", lambda: win.attributes("-topmost", True)),
+              ("полупрозрачность", lambda: win.attributes("-alpha", 0.9)),
+          ]:
+              try:
+                  action()
+                  print(f"  {name}: работает")
+              except Exception as exc:
+                  print(f"  {name}: НЕ РАБОТАЕТ — {exc}")
+          canvas = tk.Canvas(win, width=210, height=170, highlightthickness=0)
+          canvas.pack()
+          win.geometry("210x170+100+100")
+          win.update()
+          print(f"  окно отрисовано: {win.winfo_width()}x{win.winfo_height()}")
+          root.destroy()
+          PY
+
+      - name: Сколько стоит один кадр анимации
+        run: |
+          python - <<'PY'
+          # Кошка ездит по экрану, двигая настоящее окно 25 раз в секунду.
+          # Вопрос не в том, сколько кадров рисуем, а в том, успевает ли
+          # система их переваривать. Гоняем реальный цикл отрисовки и
+          # смотрим, сколько миллисекунд уходит на кадр при бюджете 40 мс.
+          import time, tkinter as tk
+          import desktop_cat as dc
+
+          root = tk.Tk(); root.withdraw()
+          screen = dc.Screen(w=root.winfo_screenwidth(), h=root.winfo_screenheight())
+          brain = dc.CatBrain(screen)
+          cat = dc.CatWindow(root, screen)
+
+          brain._go((screen.w - 220, 300), "wander")   # худший случай: идёт
+          for _ in range(10):                          # прогрев
+              brain.tick(); cat.render(brain); root.update()
+
+          times = []
+          for _ in range(300):
+              start = time.perf_counter()
+              brain.tick()
+              cat.render(brain)
+              root.update()
+              times.append((time.perf_counter() - start) * 1000)
+              if brain.state != dc.WALK:               # дошла — разворачиваем
+                  brain._go((220, 300) if brain.x > screen.w / 2
+                            else (screen.w - 220, 300), "wander")
+
+          times.sort()
+          print(f"  кадров измерено:   {len(times)}")
+          print(f"  среднее:           {sum(times) / len(times):.2f} мс")
+          print(f"  медиана:           {times[len(times) // 2]:.2f} мс")
+          print(f"  худшие 5%:         {times[int(len(times) * 0.95)]:.2f} мс")
+          print(f"  самый долгий:      {times[-1]:.2f} мс")
+          print(f"  бюджет кадра:      {dc.FRAME_MS} мс")
+          print(f"  запас:             {dc.FRAME_MS / (sum(times) / len(times)):.1f}x")
+          root.destroy()
+          PY
+
+      - name: Лягут ли фотографии кошки с прозрачным фоном
+        run: |
+          python - <<'PY'
+          # Заготовка на будущее: если рисованную кошку менять на фото
+          # настоящей, всё держится на одном — умеет ли Tk класть PNG с
+          # альфа-каналом поверх прозрачного окна. Проверяем до того, как
+          # кто-то потратит вечер на нарезку кадров.
+          import struct, zlib, tkinter as tk
+
+          def write_png(path, w, h):
+              rows = []
+              for y in range(h):
+                  row = b"\x00"
+                  for x in range(w):
+                      # левая половина непрозрачная, правая — пустая
+                      row += bytes((220, 120, 60, 255 if x < w // 2 else 0))
+                  rows.append(row)
+              raw = zlib.compress(b"".join(rows))
+              def chunk(tag, data):
+                  body = tag + data
+                  return (struct.pack(">I", len(data)) + body
+                          + struct.pack(">I", zlib.crc32(body) & 0xffffffff))
+              with open(path, "wb") as f:
+                  f.write(b"\x89PNG\r\n\x1a\n"
+                          + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+                          + chunk(b"IDAT", raw) + chunk(b"IEND", b""))
+
+          write_png("probe.png", 40, 40)
+          root = tk.Tk(); root.withdraw()
+          win = tk.Toplevel(root)
+          try:
+              win.attributes("-transparent", True)
+              win.configure(bg="systemTransparent")
+          except tk.TclError as exc:
+              print("  прозрачное окно недоступно:", exc)
+
+          try:
+              img = tk.PhotoImage(file="probe.png")
+              print(f"  PNG загружен: {img.width()}x{img.height()}")
+              # левый пиксель должен читаться непрозрачным, правый — пустым
+              correct = (not img.transparency_get(5, 20)
+                         and img.transparency_get(35, 20))
+              print(f"  альфа-канал прочитан верно: {correct}")
+              canvas = tk.Canvas(win, width=210, height=170, highlightthickness=0,
+                                 bg="systemTransparent")
+              canvas.pack()
+              canvas.create_image(105, 85, image=img)
+              win.geometry("210x170+80+80")
+              win.update()
+              print("  картинка легла на прозрачное окно: да")
+          except Exception as exc:
+              print("  НЕ РАБОТАЕТ:", exc)
+          root.destroy()
+          PY
+
+      - name: Барсик — кадры, отражение и цена кадра
+        run: |
+          python - <<'PY'
+          # У версии 3 окно крупнее и каждый кадр — картинка с шерстью и
+          # полупрозрачной тенью. Проверяем на настоящем Tk, что все кадры
+          # грузятся, что отражение влево делает сам Tk, и сколько стоит кадр.
+          import time, tkinter as tk
+          import desktop_cat as dc
+          import desktop_barsik as dr
+
+          meta = dr.load_meta()
+          root = tk.Tk(); root.withdraw()
+          start = time.perf_counter()
+          sprites = dr.SpriteSet(root, meta)
+          print(f"  кадров загружено:  {len(sprites.right)} x2 "
+                f"за {(time.perf_counter() - start) * 1000:.0f} мс")
+          img = sprites("walk", 0, 1)
+          flip = sprites("walk", 0, -1)
+          w = img.width()
+          same = all(img.get(x, y) == flip.get(w - 1 - x, y)
+                     for x in range(0, w, 17) for y in range(0, img.height(), 13))
+          print(f"  отражение влево верное: {same}")
+
+          screen = dc.Screen(w=root.winfo_screenwidth(), h=root.winfo_screenheight())
+          window = dr.window_for(meta, sprites)
+          screen.cat_w, screen.cat_h = window.W, window.H
+          brain = dr.brain_for(meta)(screen)
+          cat = window(root, screen)
+          print(f"  окно Барсика:      {window.W}x{window.H}")
+          brain._go((screen.w - 260, 320), "wander")
+          for _ in range(10):
+              brain.tick(); cat.render(brain); root.update()
+          times = []
+          for _ in range(300):
+              t0 = time.perf_counter()
+              brain.tick(); cat.render(brain); root.update()
+              times.append((time.perf_counter() - t0) * 1000)
+              if brain.state != dc.WALK:
+                  brain._go((260, 320) if brain.x > screen.w / 2
+                            else (screen.w - 260, 320), "wander")
+          times.sort()
+          print(f"  медиана кадра:     {times[len(times) // 2]:.2f} мс")
+          print(f"  худшие 5%:         {times[int(len(times) * 0.95)]:.2f} мс")
+          print(f"  бюджет кадра:      {dc.FRAME_MS} мс")
+          root.destroy()
+          PY

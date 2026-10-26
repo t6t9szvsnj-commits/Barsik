@@ -1,0 +1,65 @@
+name: Снимок экрана на Маке
+
+# Как Барсик выглядит на настоящем Маке: снимки экрана как артефакт.
+permissions:
+  contents: write     # снимки кладутся в ветку mac-shots, чтобы их можно было посмотреть
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["claude/**"]
+    paths: ["tools/mac/**", ".github/workflows/look.yml"]
+
+jobs:
+  look:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-26]
+        python: ["3.12"]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Какая macOS
+        run: sw_vers
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Скачать Барсик.app из Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download barsik-latest -p Barsik-mac.zip -R "${{ github.repository }}"
+          ditto -x -k Barsik-mac.zip app
+          ls app
+      - name: Пробные окна и сам Барсик (демо)
+        run: python tools/mac/look.py shots "app/Барсик.app/Contents/MacOS/Barsik" --demo
+      - name: Тот же Барсик из исходников
+        run: python tools/mac/look.py shots-src python versions/desktop_barsik.py --demo
+      - name: Барсик с гортензией крупно
+        run: python tools/mac/carry.py shots-src
+      - name: Версии
+        run: python -c "import sys, tkinter; print(sys.version); print('Tk', tkinter.Tcl().call('info','patchlevel'))"
+      - name: Сложить снимки в ветку mac-shots
+        if: always()
+        run: |
+          D="shots-out/${{ matrix.os }}-py${{ matrix.python }}"
+          mkdir -p "$D" && cp -r shots shots-src "$D"/ 2>/dev/null || true
+          # уменьшаем, чтобы ветка не пухла: 1/2 по каждой стороне
+          for f in $(find "$D" -name '*.png'); do sips -Z 1600 "$f" >/dev/null; done
+          git config user.name "look-bot" && git config user.email "look-bot@users.noreply.github.com"
+          git fetch origin mac-shots || true
+          git switch --orphan mac-shots-tmp
+          git rm -rfq --cached . >/dev/null 2>&1 || true
+          if git rev-parse -q --verify origin/mac-shots >/dev/null; then git reset -q origin/mac-shots; fi
+          git add -f shots-out
+          git commit -qm "снимки ${{ matrix.os }} ${{ github.sha }}" || true
+          for i in 1 2 3 4 5 6; do git push origin HEAD:mac-shots && break || (git fetch origin mac-shots && git rebase origin/mac-shots); done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: shots-${{ matrix.os }}-${{ matrix.python }}
+          path: |
+            shots
+            shots-src
